@@ -24,12 +24,16 @@ constexpr const char* SENTINEL_DIRECTORY = "/sentinel";
 constexpr const char* PROFILE_EXPORT_PATH =
     "/sentinel/confirmed_wifi_credentials.csv";
 constexpr const char* GUARD_LOG_PATH = "/sentinel/wifi_guard.csv";
+constexpr const char* RFID_LOG_PATH = "/sentinel/rfid_reads.csv";
+constexpr uint32_t FORMAT_HOLD_MS = 3000;
 
 SentinelWiFiProfiles profiles;
 bool sdMounted = false;
 String sdStatus = "Not initialized";
 uint32_t lastLoggedDeauth = 0;
 uint32_t lastLoggedDisassoc = 0;
+uint32_t formatHoldStartedAt = 0;
+bool formatTriggered = false;
 
 String cardTypeName()
 {
@@ -89,9 +93,10 @@ bool mountSDCard()
 
     if (!SD.begin(SD_CS, SPI, SD_SPI_FREQUENCY))
     {
-        sdStatus = "Check wiring or FAT32";
+        sdStatus = "No SPI response or non-FAT";
         Serial.println(
-            "SD mount failed: verify SCK=12 MISO=13 MOSI=11 CS=15, then FAT32"
+            "SD mount failed: inspect preceding sd_diskio message; "
+            "verify SCK=12 MISO=13 MOSI=11 CS=15 or format as FAT32"
         );
         return false;
     }
@@ -109,6 +114,47 @@ bool mountSDCard()
     SD.mkdir(SENTINEL_DIRECTORY);
     Serial.printf(
         "SD mounted: %s, %llu MB\n",
+        cardTypeName().c_str(),
+        SD.cardSize() / (1024ULL * 1024ULL)
+    );
+    return true;
+}
+
+bool formatAndMountSDCard()
+{
+    if (sdMounted)
+    {
+        sdStatus = "Already mounted; format blocked";
+        return false;
+    }
+
+    SD.end();
+    prepareSharedSPI();
+    Serial.println("SD format physically confirmed: attempting FAT/FAT32 format");
+
+    // The final true asks the ESP32 FatFs driver to format only after the
+    // card answers SPI but mounting reports that no supported filesystem
+    // exists. It cannot turn a missing or incorrectly wired card into a
+    // successful mount.
+    if (!SD.begin(SD_CS, SPI, SD_SPI_FREQUENCY, "/sd", 5, true))
+    {
+        sdStatus = "Format/init failed; check wiring";
+        Serial.println("SD format failed: card did not initialize or format");
+        return false;
+    }
+
+    if (SD.cardType() == CARD_NONE)
+    {
+        sdStatus = "No card detected";
+        SD.end();
+        return false;
+    }
+
+    sdMounted = true;
+    SD.mkdir(SENTINEL_DIRECTORY);
+    sdStatus = "Formatted FAT + mounted";
+    Serial.printf(
+        "SD formatted and mounted: %s, %llu MB\n",
         cardTypeName().c_str(),
         SD.cardSize() / (1024ULL * 1024ULL)
     );
@@ -230,14 +276,26 @@ void drawSDCardScreen()
     display.print(exportableProfileCount());
 
     display.setTextColor(ST77XX_WHITE);
-    display.setCursor(10, 160);
-    display.print("EXPORT writes plaintext CSV to:");
-    display.setCursor(10, 178);
-    display.print(PROFILE_EXPORT_PATH);
-
-    display.setTextColor(ST77XX_YELLOW);
-    display.setCursor(10, 198);
-    display.print("Remove card when device is off");
+    display.setCursor(10, 154);
+    if (sdMounted)
+    {
+        display.print("EXPORT: plaintext WiFi CSV");
+        display.setCursor(10, 172);
+        display.print("RFID log: ");
+        display.print(RFID_LOG_PATH);
+        display.setTextColor(ST77XX_YELLOW);
+        display.setCursor(10, 198);
+        display.print("Remove card when device is off");
+    }
+    else
+    {
+        display.setTextColor(ST77XX_YELLOW);
+        display.print("FORMAT ERASES THE CARD");
+        display.setCursor(10, 174);
+        display.print("Hold REMOUNT + EXPORT for 3 sec");
+        display.setCursor(10, 194);
+        display.print("Use only on your own SD card");
+    }
 
     display.drawFastHLine(0, 216, 320, ST77XX_WHITE);
     display.setTextColor(ST77XX_WHITE);
@@ -270,6 +328,39 @@ String macToString(const uint8_t* address)
 bool isSDCardMounted()
 {
     return sdMounted;
+}
+
+void initializeStorage()
+{
+    mountSDCard();
+}
+
+bool logRFIDRead(const String& uid, const String& type)
+{
+    if (!sdMounted)
+        return false;
+
+    SD.mkdir(SENTINEL_DIRECTORY);
+    const bool newFile = !SD.exists(RFID_LOG_PATH);
+    File file = SD.open(RFID_LOG_PATH, FILE_APPEND);
+
+    if (!file)
+    {
+        Serial.println("Cannot append RFID read to SD");
+        return false;
+    }
+
+    if (newFile)
+        file.println("uptime_ms,uid,type");
+
+    file.print(millis());
+    file.print(',');
+    file.print(csvField(uid));
+    file.print(',');
+    file.println(csvField(type));
+    file.close();
+    Serial.println("RFID read appended to SD; UID not repeated in this message");
+    return true;
 }
 
 void logWiFiGuardSnapshot(const SentinelWiFiGuardSnapshot& snapshot)
@@ -316,11 +407,49 @@ void logWiFiGuardSnapshot(const SentinelWiFiGuardSnapshot& snapshot)
 void enterSDCard()
 {
     mountSDCard();
+    formatHoldStartedAt = 0;
+    formatTriggered = false;
     drawSDCardScreen();
 }
 
 void handleSDCard()
 {
+    const bool topHeld = digitalRead(BTN_TOP) == LOW;
+    const bool bottomHeld = digitalRead(BTN_BOTTOM) == LOW;
+
+    if (!sdMounted && topHeld && bottomHeld)
+    {
+        // Keep the normal edge detector synchronized while the combination
+        // is held so release cannot accidentally trigger REMOUNT or EXPORT.
+        lastTop = LOW;
+        lastBottom = LOW;
+
+        if (formatHoldStartedAt == 0)
+        {
+            formatHoldStartedAt = millis();
+            sdStatus = "Hold both buttons: 3 sec";
+            drawSDCardScreen();
+        }
+
+        if (!formatTriggered &&
+            millis() - formatHoldStartedAt >= FORMAT_HOLD_MS)
+        {
+            formatTriggered = true;
+            sdStatus = "Formatting...";
+            drawSDCardScreen();
+            formatAndMountSDCard();
+            drawSDCardScreen();
+        }
+
+        return;
+    }
+
+    if (!topHeld || !bottomHeld)
+    {
+        formatHoldStartedAt = 0;
+        formatTriggered = false;
+    }
+
     if (pressed(BTN_TOP, lastTop))
     {
         mountSDCard();

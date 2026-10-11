@@ -1,4 +1,5 @@
 #include "FirmwareApp.h"
+#include "StorageFeatures.h"
 
 #include <MFRC522.h>
 #include <SPI.h>
@@ -11,6 +12,8 @@ uint8_t readerVersion = 0;
 String lastUid;
 String lastType;
 uint32_t lastReadMs = 0;
+uint32_t readCount = 0;
+String lastLogStatus = "SD unavailable";
 
 String uidToString(const MFRC522::Uid& uid)
 {
@@ -83,8 +86,22 @@ void drawReaderScreen()
     display.setCursor(60, 135);
     display.print(lastType.length() > 0 ? lastType : "N/A");
 
+    display.setTextColor(ST77XX_GREEN);
+    display.setCursor(10, 157);
+    display.print("Reads:");
     display.setTextColor(ST77XX_WHITE);
-    display.setCursor(10, 175);
+    display.setCursor(60, 157);
+    display.print(readCount);
+
+    display.setTextColor(ST77XX_GREEN);
+    display.setCursor(120, 157);
+    display.print("SD:");
+    display.setTextColor(ST77XX_WHITE);
+    display.setCursor(145, 157);
+    display.print(lastLogStatus);
+
+    display.setTextColor(ST77XX_WHITE);
+    display.setCursor(10, 180);
 
     if (!readerDetected)
         display.print("Check 3.3V, SPI, SS=7, RST=14");
@@ -141,6 +158,14 @@ void pollReader()
 
     reader.PICC_HaltA();
     reader.PCD_StopCrypto1();
+    digitalWrite(RFID_SS, HIGH);
+
+    readCount++;
+    if (isSDCardMounted())
+        lastLogStatus = logRFIDRead(lastUid, lastType) ? "saved" : "write error";
+    else
+        lastLogStatus = "not mounted";
+
     drawReaderScreen();
 }
 }

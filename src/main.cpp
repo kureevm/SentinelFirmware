@@ -1,4 +1,5 @@
 #include "FirmwareApp.h"
+#include "StorageFeatures.h"
 
 #include <NimBLEDevice.h>
 
@@ -35,6 +36,10 @@ void setup()
 
     display.init(240, 320);
     display.setRotation(1);
+
+    // Mount once during boot so background features can log without first
+    // opening the SD screen. A failed mount remains non-destructive.
+    initializeStorage();
 
     NimBLEDevice::init("Sentinel");
     Serial.println("BLE initialized");
