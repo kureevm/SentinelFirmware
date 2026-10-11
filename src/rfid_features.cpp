@@ -8,8 +8,25 @@
 namespace
 {
 constexpr byte SENTINEL_TOKEN_BLOCK = 4;
-constexpr uint32_t WRITE_ARM_HOLD_MS = 3000;
 constexpr uint32_t WRITE_ARM_WINDOW_MS = 10000;
+constexpr uint8_t RFID_ACTION_COUNT = 5;
+
+enum class RfidAction : uint8_t
+{
+    ReadTag,
+    WriteToken,
+    Clear,
+    Reinitialize,
+    Exit
+};
+
+const char* const RFID_ACTION_LABELS[RFID_ACTION_COUNT] = {
+    "READ TAG",
+    "WRITE TOKEN",
+    "CLEAR",
+    "REINIT READER",
+    "EXIT"
+};
 
 MFRC522 reader(RFID_SS, RFID_RST);
 bool readerDetected = false;
@@ -22,9 +39,8 @@ uint32_t lastReadMs = 0;
 uint32_t readCount = 0;
 String lastLogStatus = "SD unavailable";
 bool writeArmed = false;
-bool writeArmTriggered = false;
-uint32_t writeArmHoldStartedAt = 0;
 uint32_t writeArmExpiresAt = 0;
+uint8_t selectedAction = 0;
 
 String uidToString(const MFRC522::Uid& uid)
 {
@@ -217,17 +233,17 @@ void drawReaderScreen()
     display.setTextSize(1);
 
     display.setTextColor(ST77XX_GREEN);
-    display.setCursor(10, 52);
+    display.setCursor(10, 45);
     display.print("RC522:");
-    display.setCursor(65, 52);
+    display.setCursor(65, 45);
     display.setTextColor(readerDetected ? ST77XX_GREEN : ST77XX_RED);
     display.print(readerDetected ? "READY" : "NOT FOUND");
 
     display.setTextColor(ST77XX_GREEN);
-    display.setCursor(180, 52);
+    display.setCursor(180, 45);
     display.print("Ver:");
     display.setTextColor(ST77XX_WHITE);
-    display.setCursor(215, 52);
+    display.setCursor(215, 45);
 
     if (readerDetected)
     {
@@ -244,62 +260,76 @@ void drawReaderScreen()
     }
 
     display.setTextColor(ST77XX_GREEN);
-    display.setCursor(10, 76);
+    display.setCursor(10, 63);
     display.print("UID:");
     display.setTextColor(ST77XX_WHITE);
-    display.setCursor(50, 76);
+    display.setCursor(50, 63);
     display.print(lastUid.length() > 0 ? lastUid : "Present a tag");
 
     display.setTextColor(ST77XX_GREEN);
-    display.setCursor(10, 99);
+    display.setCursor(10, 81);
     display.print("Type:");
     display.setTextColor(ST77XX_WHITE);
-    display.setCursor(50, 99);
+    display.setCursor(50, 81);
     display.print(lastType.length() > 0 ? lastType : "N/A");
 
     display.setTextColor(ST77XX_GREEN);
-    display.setCursor(10, 122);
+    display.setCursor(10, 99);
     display.print("Token:");
     display.setTextColor(ST77XX_WHITE);
-    display.setCursor(60, 122);
+    display.setCursor(60, 99);
     display.print(lastToken);
 
     display.setTextColor(ST77XX_GREEN);
-    display.setCursor(10, 145);
-    display.print("Reads:");
-    display.setTextColor(ST77XX_WHITE);
-    display.setCursor(60, 145);
-    display.print(readCount);
-
-    display.setTextColor(ST77XX_GREEN);
-    display.setCursor(120, 145);
-    display.print("SD:");
-    display.setTextColor(ST77XX_WHITE);
-    display.setCursor(145, 145);
-    display.print(lastLogStatus);
-
-    display.setTextColor(ST77XX_GREEN);
-    display.setCursor(10, 168);
-    display.print("Write:");
+    display.setCursor(10, 117);
+    display.print("State:");
     display.setTextColor(writeArmed ? ST77XX_YELLOW : ST77XX_WHITE);
-    display.setCursor(60, 168);
+    display.setCursor(60, 117);
 
     if (!readerDetected)
         display.print("Check 3.3V, SPI, SS=7, RST=14");
     else
         display.print(writeArmed ? "ARMED - present OWN tag" : writeStatus);
 
-    display.setTextColor(ST77XX_YELLOW);
-    display.setCursor(10, 193);
-    display.print("Hold REINIT+CLEAR 3s: arm write");
+    display.setTextColor(ST77XX_GREEN);
+    display.setCursor(10, 135);
+    display.print("Reads:");
+    display.setTextColor(ST77XX_WHITE);
+    display.setCursor(60, 135);
+    display.print(readCount);
+
+    display.setTextColor(ST77XX_GREEN);
+    display.setCursor(120, 135);
+    display.print("SD:");
+    display.setTextColor(ST77XX_WHITE);
+    display.setCursor(145, 135);
+    display.print(lastLogStatus);
+
+    for (uint8_t index = 0; index < RFID_ACTION_COUNT; index++)
+    {
+        const int16_t y = 149 + index * 13;
+
+        if (index == selectedAction)
+        {
+            display.fillRoundRect(8, y - 2, 304, 12, 3, ST77XX_WHITE);
+            display.setTextColor(ST77XX_BLACK);
+        }
+        else
+        {
+            display.setTextColor(ST77XX_WHITE);
+        }
+
+        display.setCursor(18, y);
+        display.print(RFID_ACTION_LABELS[index]);
+    }
 
     display.drawFastHLine(0, 216, 320, ST77XX_WHITE);
     display.setCursor(8, 225);
-    display.print("REINIT");
+    display.print("UP");
     display.setCursor(145, 225);
-    display.print("BACK");
+    display.print("EXECUTE");
     display.setCursor(280, 225);
-    display.print("CLEAR");
+    display.print("DOWN");
 }
 
 void initializeReader()
@@ -364,10 +394,61 @@ void enterRFID()
 {
     writeArmed = false;
     writeStatus = "safe read mode";
-    writeArmHoldStartedAt = 0;
-    writeArmTriggered = false;
+    selectedAction = 0;
     initializeReader();
     drawReaderScreen();
+}
+
+void executeSelectedAction()
+{
+    const RfidAction action = static_cast<RfidAction>(selectedAction);
+
+    switch (action)
+    {
+        case RfidAction::ReadTag:
+            writeArmed = false;
+            writeStatus = "read mode: present a tag";
+            lastReadMs = 0;
+            drawReaderScreen();
+            break;
+
+        case RfidAction::WriteToken:
+            if (!readerDetected)
+            {
+                writeStatus = "reader unavailable";
+                drawReaderScreen();
+                break;
+            }
+
+            writeArmed = true;
+            writeArmExpiresAt = millis() + WRITE_ARM_WINDOW_MS;
+            writeStatus = "armed for 10 seconds";
+            drawReaderScreen();
+            break;
+
+        case RfidAction::Clear:
+            writeArmed = false;
+            lastUid = "";
+            lastType = "";
+            lastToken = "none";
+            readCount = 0;
+            writeStatus = "screen cleared";
+            drawReaderScreen();
+            break;
+
+        case RfidAction::Reinitialize:
+            writeArmed = false;
+            writeStatus = "reader reinitialized";
+            initializeReader();
+            drawReaderScreen();
+            break;
+
+        case RfidAction::Exit:
+            writeArmed = false;
+            currentScreen = Screen::MainMenu;
+            drawMenu();
+            break;
+    }
 }
 
 void handleRFID()
@@ -380,62 +461,26 @@ void handleRFID()
         drawReaderScreen();
     }
 
-    const bool topHeld = digitalRead(BTN_TOP) == LOW;
-    const bool bottomHeld = digitalRead(BTN_BOTTOM) == LOW;
-
-    if (readerDetected && topHeld && bottomHeld)
-    {
-        lastTop = LOW;
-        lastBottom = LOW;
-
-        if (writeArmHoldStartedAt == 0)
-        {
-            writeArmHoldStartedAt = millis();
-            writeStatus = "hold both buttons...";
-            drawReaderScreen();
-        }
-
-        if (!writeArmTriggered &&
-            millis() - writeArmHoldStartedAt >= WRITE_ARM_HOLD_MS)
-        {
-            writeArmTriggered = true;
-            writeArmed = true;
-            writeArmExpiresAt = millis() + WRITE_ARM_WINDOW_MS;
-            writeStatus = "armed for 10 seconds";
-            drawReaderScreen();
-        }
-
-        return;
-    }
-
-    if (!topHeld || !bottomHeld)
-    {
-        writeArmHoldStartedAt = 0;
-        writeArmTriggered = false;
-    }
-
     if (pressed(BTN_TOP, lastTop))
     {
-        writeArmed = false;
-        writeStatus = "safe read mode";
-        initializeReader();
+        if (selectedAction == 0)
+            selectedAction = RFID_ACTION_COUNT - 1;
+        else
+            selectedAction--;
+
         drawReaderScreen();
         return;
     }
 
     if (pressed(BTN_MIDDLE, lastMiddle))
     {
-        currentScreen = Screen::MainMenu;
-        drawMenu();
+        executeSelectedAction();
         return;
     }
 
     if (pressed(BTN_BOTTOM, lastBottom))
     {
-        lastUid = "";
-        lastType = "";
-        lastToken = "none";
-        writeStatus = "safe read mode";
+        selectedAction = (selectedAction + 1) % RFID_ACTION_COUNT;
         drawReaderScreen();
         return;
     }
