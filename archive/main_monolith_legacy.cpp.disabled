@@ -1,0 +1,2214 @@
+#include <Arduino.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7789.h>
+#include <NimBLEDevice.h>
+#include <SentinelWiFiGuard.h>
+#include <SentinelWiFiProfileConsole.h>
+#include <SentinelWiFiProfiles.h>
+#include <SystemInfoScreen.h>
+#include <WiFi.h>
+#include <WiFiGuardScreen.h>
+#include <esp_wifi.h>
+
+#if __has_include("wifi_credentials.h")
+#include "wifi_credentials.h"
+#endif
+
+#ifndef SENTINEL_WIFI_SSID
+#define SENTINEL_WIFI_SSID ""
+#endif
+
+#ifndef SENTINEL_WIFI_PASSWORD
+#define SENTINEL_WIFI_PASSWORD ""
+#endif
+
+// ================= TFT =================
+
+#define TFT_CS    10
+#define TFT_RST    9
+#define TFT_DC     8
+
+// ================= BUTTONS =================
+
+#define BTN_TOP     4
+#define BTN_MIDDLE  5
+#define BTN_BOTTOM  6
+
+Adafruit_ST7789 display(TFT_CS, TFT_DC, TFT_RST);
+
+// ================= MENU =================
+
+const char* menuItems[] = {
+    "Bluetooth",
+    "RFID Reader",
+    "WiFi Scan",
+    "WiFi Guard",
+    "WiFi CSI",
+    "IR Remote",
+    "System Info"
+};
+
+constexpr const char* WIFI_SSID = SENTINEL_WIFI_SSID;
+constexpr const char* WIFI_PASSWORD = SENTINEL_WIFI_PASSWORD;
+constexpr int MENU_COUNT = 7;
+
+int selectedItem = 0;
+
+// ================= BUTTON STATES =================
+
+bool lastTop = HIGH;
+bool lastMiddle = HIGH;
+bool lastBottom = HIGH;
+
+// ================= SCREENS =================
+
+enum class Screen {
+    MainMenu,
+    Bluetooth,
+    BLEDetails,
+    WiFi,
+    WiFiDetails,
+    WiFiGuard,
+    SystemInfo,
+    WiFiCSI
+};
+
+Screen currentScreen = Screen::MainMenu;
+
+// ================= BLE =================
+
+struct BLEDeviceInfo {
+    String name;
+    String address;
+    String addressType;
+
+    int rssi;
+
+    bool hasTxPower;
+    int txPower;
+
+    bool hasManufacturer;
+    uint16_t manufacturerId;
+    String manufacturerName;
+    String manufacturerData;
+
+    bool hasServiceUUID;
+    String serviceUUID;
+};
+
+constexpr int MAX_BLE_DEVICES = 20;
+
+BLEDeviceInfo bleDevices[MAX_BLE_DEVICES];
+
+int bleDeviceCount = 0;
+int bleSelected = 0;
+
+// ================= WIFI =================
+
+struct WiFiNetworkInfo {
+    String ssid;
+    String bssid;
+    int rssi;
+    int channel;
+    String security;
+    bool savedProfile;
+};
+
+constexpr int MAX_WIFI_NETWORKS = 30;
+
+WiFiNetworkInfo wifiNetworks[MAX_WIFI_NETWORKS];
+
+int wifiNetworkCount = 0;
+int wifiSelected = 0;
+
+// ================= WIFI GUARD =================
+
+SentinelWiFiGuard wifiGuard;
+SentinelWiFiProfiles wifiProfiles;
+SentinelWiFiProfileConsole wifiProfileConsole(wifiProfiles, Serial);
+WiFiGuardScreen wifiGuardScreen(display, wifiGuard);
+SystemInfoScreen systemInfoScreen(display);
+
+// ================= WIFI CSI =================
+
+portMUX_TYPE csiStatsMux = portMUX_INITIALIZER_UNLOCKED;
+
+volatile uint32_t csiPacketCount = 0;
+volatile int32_t csiLastRssi = 0;
+volatile uint32_t csiMeanMagnitude = 0;
+volatile uint32_t csiMagnitudeDelta = 0;
+
+bool csiActive = false;
+uint32_t csiLastDrawMs = 0;
+uint32_t csiRateReferenceMs = 0;
+uint32_t csiRateReferencePackets = 0;
+uint32_t csiPacketsPerSecond = 0;
+
+// ================= FORWARD DECLARATIONS =================
+
+bool pressed(int pin, bool& lastState);
+void drawMenu();
+String getSignalQuality(int rssi);
+void stopWiFiCSI();
+void stopWiFiGuard();
+
+String getWiFiSecurity(wifi_auth_mode_t encryption)
+{
+    switch (encryption)
+    {
+        case WIFI_AUTH_OPEN:
+            return "Open";
+
+        case WIFI_AUTH_WEP:
+            return "WEP";
+
+        case WIFI_AUTH_WPA_PSK:
+            return "WPA";
+
+        case WIFI_AUTH_WPA2_PSK:
+            return "WPA2";
+
+        case WIFI_AUTH_WPA_WPA2_PSK:
+            return "WPA/WPA2";
+
+        case WIFI_AUTH_WPA2_ENTERPRISE:
+            return "WPA2 Enterprise";
+
+        case WIFI_AUTH_WPA3_PSK:
+            return "WPA3";
+
+        case WIFI_AUTH_WPA2_WPA3_PSK:
+            return "WPA2/WPA3";
+
+        default:
+            return "Unknown";
+    }
+}
+
+void stopWiFiGuard()
+{
+    wifiGuardScreen.stop();
+}
+
+void drawWiFiScanning()
+{
+    display.fillScreen(ST77XX_BLACK);
+
+    display.fillRect(
+        0,
+        0,
+        320,
+        38,
+        ST77XX_BLUE
+    );
+
+    display.setTextColor(ST77XX_WHITE);
+    display.setTextSize(2);
+
+    display.setCursor(12, 11);
+    display.print("WIFI SCANNER");
+
+    display.setTextColor(ST77XX_GREEN);
+    display.setCursor(75, 95);
+    display.print("Scanning...");
+
+    display.setTextColor(ST77XX_WHITE);
+    display.setTextSize(1);
+
+    display.setCursor(75, 140);
+    display.print("Searching networks");
+}
+
+void drawWiFiResults()
+{
+    display.fillScreen(ST77XX_BLACK);
+
+    display.fillRect(
+        0,
+        0,
+        320,
+        38,
+        ST77XX_BLUE
+    );
+
+    display.setTextColor(ST77XX_WHITE);
+    display.setTextSize(2);
+
+    display.setCursor(10, 11);
+    display.print("WIFI");
+
+    display.setTextSize(1);
+    display.setCursor(245, 15);
+
+    display.print(wifiNetworkCount);
+    display.print(" found");
+
+    if (wifiNetworkCount == 0)
+    {
+        display.setTextSize(2);
+        display.setCursor(65, 100);
+        display.print("No networks");
+
+        display.setTextSize(1);
+        display.setCursor(95, 140);
+        display.print("OK = Back");
+
+        return;
+    }
+
+    constexpr int visibleRows = 5;
+
+    int firstItem = wifiSelected - 2;
+
+    if (firstItem < 0)
+        firstItem = 0;
+
+    if (firstItem > wifiNetworkCount - visibleRows)
+        firstItem = wifiNetworkCount - visibleRows;
+
+    if (firstItem < 0)
+        firstItem = 0;
+
+    for (int row = 0; row < visibleRows; row++)
+    {
+        int index = firstItem + row;
+
+        if (index >= wifiNetworkCount)
+            break;
+
+        int y = 50 + row * 32;
+
+        if (index == wifiSelected)
+        {
+            display.fillRoundRect(
+                6,
+                y - 4,
+                308,
+                27,
+                4,
+                ST77XX_WHITE
+            );
+
+            display.setTextColor(ST77XX_BLACK);
+        }
+        else
+        {
+            display.setTextColor(ST77XX_WHITE);
+        }
+
+        display.setTextSize(1);
+        display.setCursor(12, y);
+
+        String name = wifiNetworks[index].ssid;
+
+        if (name.length() == 0)
+            name = "[Hidden]";
+
+        if (name.length() > 22)
+            name = name.substring(0, 22);
+
+        display.print(name);
+
+        if (wifiNetworks[index].savedProfile)
+            display.print(" *");
+
+        display.setCursor(235, y);
+        display.print(wifiNetworks[index].rssi);
+        display.print(" dBm");
+    }
+
+    display.setTextColor(ST77XX_WHITE);
+
+    display.setCursor(8, 225);
+    display.print("UP");
+
+    display.setCursor(135, 225);
+    display.print("OK SELECT");
+
+    display.setCursor(280, 225);
+    display.print("DOWN");
+}
+
+bool connectToWiFi(const String& requestedSsid = "")
+{
+    stopWiFiGuard();
+
+    Serial.println();
+    Serial.println("WiFi connection requested");
+
+    SentinelWiFiProfile savedProfile;
+    String selectedSsid;
+    String selectedPassword;
+    bool usesSavedProfile = false;
+
+    if (requestedSsid.length() > 0 &&
+        wifiProfiles.find(requestedSsid, savedProfile))
+    {
+        selectedSsid = savedProfile.ssid;
+        selectedPassword = savedProfile.password;
+        usesSavedProfile = true;
+    }
+    else if (requestedSsid.length() == 0 &&
+             wifiProfiles.preferred(savedProfile))
+    {
+        selectedSsid = savedProfile.ssid;
+        selectedPassword = savedProfile.password;
+        usesSavedProfile = true;
+    }
+    else if (WIFI_SSID[0] != '\0' &&
+             (requestedSsid.length() == 0 || requestedSsid == WIFI_SSID))
+    {
+        selectedSsid = WIFI_SSID;
+        selectedPassword = WIFI_PASSWORD;
+    }
+
+    if (selectedSsid.length() == 0)
+    {
+        display.fillScreen(ST77XX_BLACK);
+        display.fillRect(0, 0, 320, 38, ST77XX_BLUE);
+        display.setTextColor(ST77XX_WHITE);
+        display.setTextSize(2);
+        display.setCursor(10, 11);
+        display.print("WIFI SETUP");
+
+        display.setTextSize(1);
+        display.setTextColor(ST77XX_RED);
+        display.setCursor(10, 70);
+        display.print("WiFi is not configured");
+        display.setTextColor(ST77XX_WHITE);
+        display.setCursor(10, 100);
+        display.print("Save profile over USB:");
+        display.setCursor(10, 116);
+        display.print("WIFI_PROFILE_HELP");
+
+        Serial.println("WiFi profile not found; use WIFI_PROFILE_HELP over USB");
+        return false;
+    }
+
+    Serial.printf("SSID: %s\n", selectedSsid.c_str());
+    Serial.printf("Password length: %u\n", selectedPassword.length());
+
+    display.fillScreen(ST77XX_BLACK);
+
+    display.fillRect(
+        0,
+        0,
+        320,
+        38,
+        ST77XX_BLUE
+    );
+
+    display.setTextColor(ST77XX_WHITE);
+    display.setTextSize(2);
+
+    display.setCursor(10, 11);
+    display.print("WIFI CONNECT");
+
+    display.setTextSize(1);
+
+    display.setCursor(10, 60);
+    display.print("SSID:");
+
+    display.setCursor(70, 60);
+    display.print(selectedSsid);
+
+    display.setCursor(10, 90);
+    display.print("Connecting...");
+
+    WiFi.mode(WIFI_STA);
+
+    WiFi.begin(selectedSsid.c_str(), selectedPassword.c_str());
+    selectedPassword = "";
+
+    unsigned long start = millis();
+
+    while (
+        WiFi.status() != WL_CONNECTED &&
+        millis() - start < 15000
+    )
+    {
+        delay(250);
+    }
+
+    display.fillScreen(ST77XX_BLACK);
+
+    display.fillRect(
+        0,
+        0,
+        320,
+        38,
+        ST77XX_BLUE
+    );
+
+    display.setTextColor(ST77XX_WHITE);
+    display.setTextSize(2);
+
+    display.setCursor(10, 11);
+    display.print("WIFI");
+
+    display.setTextSize(1);
+
+    if (WiFi.status() == WL_CONNECTED)
+    {
+        if (usesSavedProfile)
+            wifiProfiles.markPreferred(selectedSsid);
+
+        display.setTextColor(ST77XX_GREEN);
+
+        display.setCursor(10, 60);
+        display.print("CONNECTED");
+
+        display.setTextColor(ST77XX_WHITE);
+
+        display.setCursor(10, 90);
+        display.print("IP:");
+
+        display.setCursor(70, 90);
+        display.print(
+            WiFi.localIP()
+        );
+
+        display.setCursor(10, 110);
+        display.print("Gateway:");
+
+        display.setCursor(70, 110);
+        display.print(
+            WiFi.gatewayIP()
+        );
+
+        display.setCursor(10, 130);
+        display.print("Subnet:");
+
+        display.setCursor(70, 130);
+        display.print(
+            WiFi.subnetMask()
+        );
+
+        Serial.println();
+        Serial.println("WiFi connected");
+
+        Serial.print("IP: ");
+        Serial.println(
+            WiFi.localIP()
+        );
+
+        Serial.print("Gateway: ");
+        Serial.println(
+            WiFi.gatewayIP()
+        );
+
+        Serial.print("Subnet: ");
+        Serial.println(
+            WiFi.subnetMask()
+        );
+
+        return true;
+    }
+
+    display.setTextColor(ST77XX_RED);
+
+    display.setCursor(10, 80);
+    display.print("CONNECTION FAILED");
+
+    Serial.println(
+        "WiFi connection failed"
+    );
+
+    return false;
+}
+
+void resetWiFiCSIStats()
+{
+    portENTER_CRITICAL(&csiStatsMux);
+    csiPacketCount = 0;
+    csiLastRssi = 0;
+    csiMeanMagnitude = 0;
+    csiMagnitudeDelta = 0;
+    portEXIT_CRITICAL(&csiStatsMux);
+
+    csiRateReferencePackets = 0;
+    csiPacketsPerSecond = 0;
+    csiRateReferenceMs = millis();
+}
+
+void wifiCSIReceive(void*, wifi_csi_info_t* info)
+{
+    if (info == nullptr || info->buf == nullptr || info->len < 2)
+        return;
+
+    uint16_t start = info->first_word_invalid && info->len > 4
+        ? 4
+        : 0;
+
+    uint32_t magnitudeSum = 0;
+    uint16_t complexSamples = 0;
+
+    for (uint16_t i = start; i + 1 < info->len; i += 2)
+    {
+        int imaginary = info->buf[i];
+        int real = info->buf[i + 1];
+
+        magnitudeSum += abs(imaginary) + abs(real);
+        complexSamples++;
+    }
+
+    if (complexSamples == 0)
+        return;
+
+    uint32_t meanMagnitude = magnitudeSum / complexSamples;
+
+    portENTER_CRITICAL(&csiStatsMux);
+
+    uint32_t previousMagnitude = csiMeanMagnitude;
+    uint32_t delta = previousMagnitude > meanMagnitude
+        ? previousMagnitude - meanMagnitude
+        : meanMagnitude - previousMagnitude;
+
+    csiPacketCount++;
+    csiLastRssi = info->rx_ctrl.rssi;
+    csiMeanMagnitude = meanMagnitude;
+    csiMagnitudeDelta = previousMagnitude == 0
+        ? 0
+        : (csiMagnitudeDelta * 7 + delta) / 8;
+
+    portEXIT_CRITICAL(&csiStatsMux);
+}
+
+void drawWiFiCSI()
+{
+    uint32_t packets;
+    int32_t rssi;
+    uint32_t magnitude;
+    uint32_t delta;
+
+    portENTER_CRITICAL(&csiStatsMux);
+    packets = csiPacketCount;
+    rssi = csiLastRssi;
+    magnitude = csiMeanMagnitude;
+    delta = csiMagnitudeDelta;
+    portEXIT_CRITICAL(&csiStatsMux);
+
+    uint32_t now = millis();
+    uint32_t elapsed = now - csiRateReferenceMs;
+
+    if (elapsed >= 1000)
+    {
+        csiPacketsPerSecond =
+            (packets - csiRateReferencePackets) * 1000UL / elapsed;
+
+        csiRateReferencePackets = packets;
+        csiRateReferenceMs = now;
+    }
+
+    display.fillScreen(ST77XX_BLACK);
+    display.fillRect(0, 0, 320, 38, ST77XX_BLUE);
+    display.setTextColor(ST77XX_WHITE);
+    display.setTextSize(2);
+    display.setCursor(10, 11);
+    display.print("WIFI CSI");
+
+    display.setTextSize(1);
+
+    display.setTextColor(csiActive ? ST77XX_GREEN : ST77XX_RED);
+    display.setCursor(245, 15);
+    display.print(csiActive ? "LIVE" : "STOPPED");
+
+    display.setTextColor(ST77XX_GREEN);
+    display.setCursor(10, 55);
+    display.print("SSID:");
+    display.setTextColor(ST77XX_WHITE);
+    display.setCursor(95, 55);
+    String ssid = WiFi.SSID();
+    if (ssid.length() > 27)
+        ssid = ssid.substring(0, 27);
+    display.print(ssid.length() > 0 ? ssid : "Not connected");
+
+    display.setTextColor(ST77XX_GREEN);
+    display.setCursor(10, 80);
+    display.print("Channel:");
+    display.setTextColor(ST77XX_WHITE);
+    display.setCursor(95, 80);
+    display.print(WiFi.channel());
+
+    display.setTextColor(ST77XX_GREEN);
+    display.setCursor(10, 105);
+    display.print("Frames:");
+    display.setTextColor(ST77XX_WHITE);
+    display.setCursor(95, 105);
+    display.print(packets);
+
+    display.setTextColor(ST77XX_GREEN);
+    display.setCursor(10, 130);
+    display.print("Rate:");
+    display.setTextColor(ST77XX_WHITE);
+    display.setCursor(95, 130);
+    display.print(csiPacketsPerSecond);
+    display.print(" fps");
+
+    display.setTextColor(ST77XX_GREEN);
+    display.setCursor(10, 155);
+    display.print("RSSI:");
+    display.setTextColor(ST77XX_WHITE);
+    display.setCursor(95, 155);
+    if (packets > 0)
+    {
+        display.print(rssi);
+        display.print(" dBm");
+    }
+    else
+    {
+        display.print("Waiting");
+    }
+
+    display.setTextColor(ST77XX_GREEN);
+    display.setCursor(10, 180);
+    display.print("Mean |I|+|Q|:");
+    display.setTextColor(ST77XX_WHITE);
+    display.setCursor(135, 180);
+    display.print(magnitude);
+
+    display.setTextColor(ST77XX_GREEN);
+    display.setCursor(10, 200);
+    display.print("Delta EMA:");
+    display.setTextColor(ST77XX_WHITE);
+    display.setCursor(95, 200);
+    display.print(delta);
+
+    display.drawFastHLine(0, 216, 320, ST77XX_WHITE);
+    display.setTextColor(ST77XX_WHITE);
+    display.setCursor(8, 225);
+    display.print("RESET");
+    display.setCursor(140, 225);
+    display.print("BACK");
+    display.setCursor(280, 225);
+    display.print(csiActive ? "STOP" : "START");
+
+    csiLastDrawMs = now;
+}
+
+bool startWiFiCSI()
+{
+    if (csiActive)
+        return true;
+
+    stopWiFiGuard();
+
+    if (WiFi.status() != WL_CONNECTED && !connectToWiFi())
+    {
+        csiLastDrawMs = millis();
+        return false;
+    }
+
+    resetWiFiCSIStats();
+
+    wifi_csi_config_t config = {};
+    config.lltf_en = true;
+    config.htltf_en = true;
+    config.stbc_htltf2_en = true;
+    config.ltf_merge_en = true;
+    config.channel_filter_en = false;
+    config.manu_scale = false;
+    config.shift = 0;
+
+    wifi_promiscuous_filter_t filter = {};
+    filter.filter_mask =
+        WIFI_PROMIS_FILTER_MASK_MGMT |
+        WIFI_PROMIS_FILTER_MASK_DATA;
+
+    esp_err_t result = esp_wifi_set_ps(WIFI_PS_NONE);
+
+    if (result == ESP_OK)
+        result = esp_wifi_set_promiscuous_filter(&filter);
+
+    if (result == ESP_OK)
+        result = esp_wifi_set_csi_config(&config);
+
+    if (result == ESP_OK)
+        result = esp_wifi_set_csi_rx_cb(wifiCSIReceive, nullptr);
+
+    if (result == ESP_OK)
+        result = esp_wifi_set_promiscuous(true);
+
+    if (result == ESP_OK)
+        result = esp_wifi_set_csi(true);
+
+    if (result != ESP_OK)
+    {
+        esp_wifi_set_csi(false);
+        esp_wifi_set_promiscuous(false);
+        esp_wifi_set_csi_rx_cb(nullptr, nullptr);
+        esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+
+        Serial.printf(
+            "CSI start failed: %s (%d)\n",
+            esp_err_to_name(result),
+            result
+        );
+
+        csiActive = false;
+        drawWiFiCSI();
+        return false;
+    }
+
+    csiActive = true;
+    Serial.println("CSI monitor started (diagnostic metrics only)");
+    drawWiFiCSI();
+    return true;
+}
+
+void stopWiFiCSI()
+{
+    if (!csiActive)
+        return;
+
+    esp_wifi_set_csi(false);
+    esp_wifi_set_promiscuous(false);
+    esp_wifi_set_csi_rx_cb(nullptr, nullptr);
+    esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+
+    csiActive = false;
+    Serial.println("CSI monitor stopped");
+}
+
+void handleWiFiCSI()
+{
+    if (pressed(BTN_TOP, lastTop))
+    {
+        resetWiFiCSIStats();
+        drawWiFiCSI();
+    }
+
+    if (pressed(BTN_MIDDLE, lastMiddle))
+    {
+        stopWiFiCSI();
+        currentScreen = Screen::MainMenu;
+        drawMenu();
+        return;
+    }
+
+    if (pressed(BTN_BOTTOM, lastBottom))
+    {
+        if (csiActive)
+            stopWiFiCSI();
+        else
+            startWiFiCSI();
+
+        drawWiFiCSI();
+    }
+
+    if (millis() - csiLastDrawMs >= 500)
+        drawWiFiCSI();
+}
+
+void scanWiFi()
+{
+    stopWiFiGuard();
+    drawWiFiScanning();
+
+    Serial.println();
+    Serial.println("WiFi scan started");
+
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+
+    delay(100);
+
+    int count = WiFi.scanNetworks(
+        false,
+        true
+    );
+
+    wifiNetworkCount = 0;
+    wifiSelected = 0;
+
+    if (count < 0)
+        count = 0;
+
+    for (int i = 0;
+         i < count &&
+         wifiNetworkCount < MAX_WIFI_NETWORKS;
+         i++)
+    {
+        WiFiNetworkInfo& saved =
+            wifiNetworks[wifiNetworkCount];
+
+        saved.ssid = WiFi.SSID(i);
+        saved.bssid = WiFi.BSSIDstr(i);
+        saved.rssi = WiFi.RSSI(i);
+        saved.channel = WiFi.channel(i);
+        saved.savedProfile =
+            wifiProfiles.contains(saved.ssid) ||
+            (WIFI_SSID[0] != '\0' && saved.ssid == WIFI_SSID);
+
+        saved.security =
+            getWiFiSecurity(
+                WiFi.encryptionType(i)
+            );
+
+        Serial.println("-------------------------");
+
+        Serial.printf(
+            "#%d\n",
+            wifiNetworkCount
+        );
+
+        Serial.printf(
+            "SSID: %s\n",
+            saved.ssid.length() > 0
+                ? saved.ssid.c_str()
+                : "[Hidden]"
+        );
+
+        Serial.printf(
+            "BSSID: %s\n",
+            saved.bssid.c_str()
+        );
+
+        Serial.printf(
+            "RSSI: %d dBm\n",
+            saved.rssi
+        );
+
+        Serial.printf(
+            "Channel: %d\n",
+            saved.channel
+        );
+
+        Serial.printf(
+            "Security: %s\n",
+            saved.security.c_str()
+        );
+
+        wifiNetworkCount++;
+    }
+
+    WiFi.scanDelete();
+
+    // Сортировка: сильнейший сигнал сверху
+
+    for (int i = 0; i < wifiNetworkCount - 1; i++)
+    {
+        for (int j = 0;
+             j < wifiNetworkCount - i - 1;
+             j++)
+        {
+            if (
+                wifiNetworks[j].rssi <
+                wifiNetworks[j + 1].rssi
+            )
+            {
+                WiFiNetworkInfo temp =
+                    wifiNetworks[j];
+
+                wifiNetworks[j] =
+                    wifiNetworks[j + 1];
+
+                wifiNetworks[j + 1] =
+                    temp;
+            }
+        }
+    }
+
+    Serial.printf(
+        "WiFi scan completed: %d networks\n",
+        wifiNetworkCount
+    );
+
+    drawWiFiResults();
+}
+
+void drawWiFiDetails()
+{
+    if (wifiNetworkCount == 0)
+        return;
+
+    WiFiNetworkInfo& network =
+        wifiNetworks[wifiSelected];
+
+    display.fillScreen(ST77XX_BLACK);
+
+    display.fillRect(
+        0,
+        0,
+        320,
+        34,
+        ST77XX_BLUE
+    );
+
+    display.setTextColor(ST77XX_WHITE);
+    display.setTextSize(2);
+
+    display.setCursor(10, 9);
+    display.print("WIFI NETWORK");
+
+    display.setTextSize(1);
+
+    int y = 50;
+
+    // SSID
+
+    display.setTextColor(ST77XX_GREEN);
+    display.setCursor(10, y);
+    display.print("SSID:");
+
+    display.setTextColor(ST77XX_WHITE);
+    display.setCursor(95, y);
+
+    if (network.ssid.length() > 0)
+        display.print(network.ssid);
+    else
+        display.print("[Hidden]");
+
+    y += 22;
+
+    // BSSID
+
+    display.setTextColor(ST77XX_GREEN);
+    display.setCursor(10, y);
+    display.print("BSSID:");
+
+    display.setTextColor(ST77XX_WHITE);
+    display.setCursor(95, y);
+    display.print(network.bssid);
+
+    y += 22;
+
+    // RSSI
+
+    display.setTextColor(ST77XX_GREEN);
+    display.setCursor(10, y);
+    display.print("RSSI:");
+
+    display.setTextColor(ST77XX_WHITE);
+    display.setCursor(95, y);
+    display.print(network.rssi);
+    display.print(" dBm");
+
+    y += 22;
+
+    // Signal
+
+    display.setTextColor(ST77XX_GREEN);
+    display.setCursor(10, y);
+    display.print("Signal:");
+
+    display.setTextColor(ST77XX_WHITE);
+    display.setCursor(95, y);
+    display.print(
+        getSignalQuality(network.rssi)
+    );
+
+    y += 22;
+
+    // Channel
+
+    display.setTextColor(ST77XX_GREEN);
+    display.setCursor(10, y);
+    display.print("Channel:");
+
+    display.setTextColor(ST77XX_WHITE);
+    display.setCursor(95, y);
+    display.print(network.channel);
+
+    y += 22;
+
+    // Frequency
+
+    display.setTextColor(ST77XX_GREEN);
+    display.setCursor(10, y);
+    display.print("Frequency:");
+
+    display.setTextColor(ST77XX_WHITE);
+    display.setCursor(95, y);
+
+    int frequency =
+        2407 + network.channel * 5;
+
+    display.print(frequency);
+    display.print(" MHz");
+
+    y += 22;
+
+    // Security
+
+    display.setTextColor(ST77XX_GREEN);
+    display.setCursor(10, y);
+    display.print("Security:");
+
+    display.setTextColor(ST77XX_WHITE);
+    display.setCursor(95, y);
+    display.print(network.security);
+
+    y += 22;
+
+    display.setTextColor(ST77XX_GREEN);
+    display.setCursor(10, y);
+    display.print("Saved profile:");
+    display.setTextColor(
+        network.savedProfile
+            ? ST77XX_GREEN
+            : ST77XX_RED
+    );
+    display.setCursor(105, y);
+    display.print(network.savedProfile ? "Yes" : "No");
+
+    // Footer
+
+    display.drawFastHLine(
+        0,
+        216,
+        320,
+        ST77XX_WHITE
+    );
+
+    display.setCursor(8, 225);
+    display.print("RESCAN");
+
+    display.setCursor(135, 225);
+    display.print("BACK");
+
+    display.setCursor(260, 225);
+    display.print("CONNECT");
+}
+
+void handleWiFi()
+{
+    if (pressed(BTN_TOP, lastTop))
+    {
+        if (wifiNetworkCount > 0)
+        {
+            wifiSelected--;
+
+            if (wifiSelected < 0)
+                wifiSelected = wifiNetworkCount - 1;
+
+            drawWiFiResults();
+        }
+    }
+
+    if (pressed(BTN_BOTTOM, lastBottom))
+    {
+        if (wifiNetworkCount > 0)
+        {
+            wifiSelected++;
+
+            if (wifiSelected >= wifiNetworkCount)
+                wifiSelected = 0;
+
+            drawWiFiResults();
+        }
+    }
+
+    if (pressed(BTN_MIDDLE, lastMiddle))
+    {
+        if (wifiNetworkCount > 0)
+        {
+            currentScreen =
+                Screen::WiFiDetails;
+
+            drawWiFiDetails();
+        }
+        else
+        {
+            currentScreen =
+                Screen::MainMenu;
+
+            drawMenu();
+        }
+    }
+}
+
+void handleWiFiDetails()
+{
+    if (pressed(BTN_TOP, lastTop))
+    {
+        currentScreen = Screen::WiFi;
+
+        scanWiFi();
+        return;
+    }
+
+    if (pressed(BTN_MIDDLE, lastMiddle))
+    {
+        currentScreen = Screen::WiFi;
+
+        drawWiFiResults();
+        return;
+    }
+
+    if (pressed(BTN_BOTTOM, lastBottom))
+    {
+        WiFiNetworkInfo& network = wifiNetworks[wifiSelected];
+
+        if (network.savedProfile)
+        {
+            connectToWiFi(network.ssid);
+            delay(1500);
+        }
+        else
+        {
+            display.fillRect(0, 190, 320, 25, ST77XX_BLACK);
+            display.setTextColor(ST77XX_RED);
+            display.setCursor(10, 198);
+            display.print("No saved profile; configure over USB");
+            delay(1500);
+        }
+
+        currentScreen = Screen::WiFi;
+        drawWiFiResults();
+        return;
+    }
+}
+
+
+// ================= BUTTON =================
+
+bool pressed(int pin, bool& lastState)
+{
+    bool currentState = digitalRead(pin);
+
+    bool event =
+        lastState == HIGH &&
+        currentState == LOW;
+
+    lastState = currentState;
+
+    return event;
+}
+
+// ================= MAIN MENU =================
+
+void drawMenu()
+{
+    display.fillScreen(ST77XX_BLACK);
+
+    display.fillRect(
+        0,
+        0,
+        320,
+        38,
+        ST77XX_BLUE
+    );
+
+    display.setTextSize(2);
+    display.setTextColor(ST77XX_WHITE);
+
+    display.setCursor(12, 11);
+    display.print("SENTINEL");
+
+    for (int i = 0; i < MENU_COUNT; i++)
+    {
+        int y = 45 + i * 25;
+
+        if (i == selectedItem)
+        {
+            display.fillRoundRect(
+                8,
+                y - 5,
+                304,
+                23,
+                5,
+                ST77XX_WHITE
+            );
+
+            display.setTextColor(ST77XX_BLACK);
+        }
+        else
+        {
+            display.setTextColor(ST77XX_WHITE);
+        }
+
+        display.setCursor(20, y);
+        display.print(menuItems[i]);
+    }
+
+    display.setTextSize(1);
+    display.setTextColor(ST77XX_WHITE);
+
+    display.setCursor(8, 225);
+    display.print("UP");
+
+    display.setCursor(148, 225);
+    display.print("OK");
+
+    display.setCursor(280, 225);
+    display.print("DOWN");
+}
+
+// ================= BLE SCANNING SCREEN =================
+
+void drawBLEScanning()
+{
+    display.fillScreen(ST77XX_BLACK);
+
+    display.fillRect(
+        0,
+        0,
+        320,
+        38,
+        ST77XX_BLUE
+    );
+
+    display.setTextColor(ST77XX_WHITE);
+    display.setTextSize(2);
+
+    display.setCursor(12, 11);
+    display.print("BLE SCANNER");
+
+    display.setTextColor(ST77XX_GREEN);
+    display.setTextSize(2);
+
+    display.setCursor(75, 95);
+    display.print("Scanning...");
+
+    display.setTextColor(ST77XX_WHITE);
+    display.setTextSize(1);
+
+    display.setCursor(85, 140);
+    display.print("Please wait 5 sec");
+}
+
+// ================= BLE RESULTS =================
+
+void drawBLEResults()
+{
+    display.fillScreen(ST77XX_BLACK);
+
+    display.fillRect(
+        0,
+        0,
+        320,
+        38,
+        ST77XX_BLUE
+    );
+
+    display.setTextColor(ST77XX_WHITE);
+    display.setTextSize(2);
+
+    display.setCursor(10, 11);
+    display.print("BLE");
+
+    display.setTextSize(1);
+    display.setCursor(245, 15);
+
+    display.print(bleDeviceCount);
+    display.print(" found");
+
+    if (bleDeviceCount == 0)
+    {
+        display.setTextSize(2);
+        display.setCursor(65, 100);
+        display.print("No devices");
+
+        display.setTextSize(1);
+        display.setCursor(95, 140);
+        display.print("OK = Back");
+
+        return;
+    }
+
+    constexpr int visibleRows = 5;
+
+    int firstItem = bleSelected - 2;
+
+    if (firstItem < 0)
+        firstItem = 0;
+
+    if (firstItem > bleDeviceCount - visibleRows)
+        firstItem = bleDeviceCount - visibleRows;
+
+    if (firstItem < 0)
+        firstItem = 0;
+
+    for (int row = 0; row < visibleRows; row++)
+    {
+        int index = firstItem + row;
+
+        if (index >= bleDeviceCount)
+            break;
+
+        int y = 50 + row * 32;
+
+        if (index == bleSelected)
+        {
+            display.fillRoundRect(
+                6,
+                y - 4,
+                308,
+                27,
+                4,
+                ST77XX_WHITE
+            );
+
+            display.setTextColor(ST77XX_BLACK);
+        }
+        else
+        {
+            display.setTextColor(ST77XX_WHITE);
+        }
+
+        display.setTextSize(1);
+
+        display.setCursor(12, y);
+
+    if (bleDevices[index].name.length() > 0)
+    {
+        String shortName = bleDevices[index].name;
+
+        if (shortName.length() > 22)
+        {
+            shortName = shortName.substring(0, 22);
+        }
+
+        display.print(shortName);
+    }
+    else if (
+        bleDevices[index].hasManufacturer &&
+        bleDevices[index].manufacturerName != "Unknown"
+    )
+    {
+        display.print("[");
+
+        display.print(
+            bleDevices[index].manufacturerName
+        );
+
+        display.print("]");
+    }
+    else
+    {
+        display.print("[Unknown]");
+    }
+
+        display.setCursor(235, y);
+
+        display.print(
+            bleDevices[index].rssi
+        );
+
+        display.print(" dBm");
+    }
+
+    display.setTextColor(ST77XX_WHITE);
+    display.setTextSize(1);
+
+    display.setCursor(8, 225);
+    display.print("UP");
+
+    display.setCursor(135, 225);
+    display.print("OK BACK");
+
+    display.setCursor(280, 225);
+    display.print("DOWN");
+}
+
+String getSignalQuality(int rssi)
+{
+    if (rssi >= -50)
+        return "Excellent";
+
+    if (rssi >= -65)
+        return "Good";
+
+    if (rssi >= -80)
+        return "Weak";
+
+    return "Very weak";
+}
+
+void drawBLEDetails()
+{
+    if (bleDeviceCount == 0)
+        return;
+
+    BLEDeviceInfo& device =
+        bleDevices[bleSelected];
+
+    display.fillScreen(ST77XX_BLACK);
+
+    // Header
+    display.fillRect(
+        0,
+        0,
+        320,
+        34,
+        ST77XX_BLUE
+    );
+
+    display.setTextColor(ST77XX_WHITE);
+    display.setTextSize(2);
+
+    display.setCursor(10, 9);
+    display.print("BLE DEVICE");
+
+    display.setTextSize(1);
+
+    int y = 45;
+
+    // ---------- NAME ----------
+
+    display.setTextColor(ST77XX_GREEN);
+    display.setCursor(10, y);
+    display.print("Name:");
+
+    display.setTextColor(ST77XX_WHITE);
+    display.setCursor(95, y);
+
+    if (device.name.length() > 0)
+    {
+        String name = device.name;
+
+        if (name.length() > 30)
+            name = name.substring(0, 30);
+
+        display.print(name);
+    }
+    else
+    {
+        display.print("[Unknown]");
+    }
+
+    y += 20;
+
+    // ---------- ADDRESS ----------
+
+    display.setTextColor(ST77XX_GREEN);
+    display.setCursor(10, y);
+    display.print("Address:");
+
+    display.setTextColor(ST77XX_WHITE);
+    display.setCursor(95, y);
+    display.print(device.address);
+
+    y += 20;
+
+    // ---------- ADDRESS TYPE ----------
+
+    display.setTextColor(ST77XX_GREEN);
+    display.setCursor(10, y);
+    display.print("Addr type:");
+
+    display.setTextColor(ST77XX_WHITE);
+    display.setCursor(95, y);
+    display.print(device.addressType);
+
+    y += 20;
+
+ // ---------- RSSI ----------
+
+display.setTextColor(ST77XX_GREEN);
+display.setCursor(10, y);
+display.print("RSSI:");
+
+display.setTextColor(ST77XX_WHITE);
+display.setCursor(95, y);
+display.print(device.rssi);
+display.print(" dBm");
+
+y += 20;
+
+// ---------- SIGNAL ----------
+
+display.setTextColor(ST77XX_GREEN);
+display.setCursor(10, y);
+display.print("Signal:");
+
+display.setTextColor(ST77XX_WHITE);
+display.setCursor(95, y);
+display.print(getSignalQuality(device.rssi));
+
+y += 20;
+
+// ---------- TX POWER ----------
+
+display.setTextColor(ST77XX_GREEN);
+display.setCursor(10, y);
+display.print("TX Power:");
+
+display.setTextColor(ST77XX_WHITE);
+display.setCursor(95, y);
+
+if (device.hasTxPower)
+{
+    display.print(device.txPower);
+    display.print(" dBm");
+}
+else
+{
+    display.print("N/A");
+}
+
+y += 20;
+    // ---------- MANUFACTURER ----------
+
+    display.setTextColor(ST77XX_GREEN);
+    display.setCursor(10, y);
+    display.print("Vendor:");
+
+    display.setTextColor(ST77XX_WHITE);
+    display.setCursor(95, y);
+
+    if (device.hasManufacturer)
+    {
+        display.print(device.manufacturerName);
+
+        display.print(" 0x");
+
+        if (device.manufacturerId < 0x1000)
+            display.print("0");
+
+        if (device.manufacturerId < 0x0100)
+            display.print("0");
+
+        if (device.manufacturerId < 0x0010)
+            display.print("0");
+
+        display.print(
+            device.manufacturerId,
+            HEX
+        );
+    }
+    else
+    {
+        display.print("N/A");
+    }
+
+    y += 20;
+
+    // ---------- SERVICE UUID ----------
+
+    display.setTextColor(ST77XX_GREEN);
+    display.setCursor(10, y);
+    display.print("Service:");
+
+    display.setTextColor(ST77XX_WHITE);
+    display.setCursor(95, y);
+
+    if (device.hasServiceUUID)
+    {
+        String uuid =
+            device.serviceUUID;
+
+        if (uuid.length() > 32)
+            uuid = uuid.substring(0, 32);
+
+        display.print(uuid);
+    }
+    else
+    {
+        display.print("N/A");
+    }
+
+    // ---------- FOOTER ----------
+
+    display.drawFastHLine(
+        0,
+        216,
+        320,
+        ST77XX_WHITE
+    );
+
+    display.setTextColor(ST77XX_WHITE);
+    display.setTextSize(1);
+
+    display.setCursor(8, 225);
+    display.print("RESCAN");
+
+    display.setCursor(135, 225);
+    display.print("BACK");
+
+    display.setCursor(270, 225);
+    display.print("MENU");
+}
+// ================= BLE SCAN =================
+
+String getManufacturerName(uint16_t id)
+{
+    switch (id)
+    {
+        case 0x004C:
+            return "Apple";
+
+        case 0x0006:
+            return "Microsoft";
+
+        case 0x0075:
+            return "Samsung";
+
+        case 0x038F:
+            return "Xiaomi";
+
+        case 0x00E0:
+            return "Google";
+
+        default:
+            return "Unknown";
+    }
+}
+
+String bytesToHex(const std::string& data)
+{
+    String result;
+
+    for (size_t i = 0; i < data.length(); i++)
+    {
+        char buffer[4];
+
+        snprintf(
+            buffer,
+            sizeof(buffer),
+            "%02X",
+            (uint8_t)data[i]
+        );
+
+        result += buffer;
+
+        if (i + 1 < data.length())
+            result += " ";
+    }
+
+    return result;
+}
+void sortBLEDevicesByRSSI()
+{
+    for (int i = 0; i < bleDeviceCount - 1; i++)
+    {
+        for (int j = 0; j < bleDeviceCount - i - 1; j++)
+        {
+            // -40 сильнее, чем -80,
+            // поэтому большее значение RSSI должно быть выше.
+            if (bleDevices[j].rssi < bleDevices[j + 1].rssi)
+            {
+                BLEDeviceInfo temp = bleDevices[j];
+
+                bleDevices[j] = bleDevices[j + 1];
+                bleDevices[j + 1] = temp;
+            }
+        }
+    }
+}
+void scanBLE()
+{
+    stopWiFiGuard();
+    drawBLEScanning();
+
+    Serial.println();
+    Serial.println("BLE scan started");
+
+    NimBLEScan* scanner =
+        NimBLEDevice::getScan();
+
+    scanner->setActiveScan(true);
+
+    scanner->setInterval(100);
+    scanner->setWindow(100);
+
+    scanner->clearResults();
+
+    NimBLEScanResults results =
+        scanner->getResults(
+            5000,
+            false
+        );
+
+    bleDeviceCount = 0;
+    bleSelected = 0;
+
+    int count = results.getCount();
+
+    Serial.printf(
+        "BLE devices found: %d\n",
+        count
+    );
+
+    for (int i = 0;
+         i < count &&
+         bleDeviceCount < MAX_BLE_DEVICES;
+         i++)
+    {
+        const NimBLEAdvertisedDevice* device =
+            results.getDevice(i);
+
+        if (device == nullptr)
+            continue;
+
+    BLEDeviceInfo& saved =
+        bleDevices[bleDeviceCount];
+
+    // ---------- BASIC ----------
+
+    saved.name =
+        device->getName().c_str();
+
+    saved.address =
+        device->getAddress()
+            .toString()
+            .c_str();
+
+    saved.rssi =
+        device->getRSSI();
+
+    // ---------- ADDRESS TYPE ----------
+
+    uint8_t addressType =
+        device->getAddressType();
+
+    if (addressType == 0)
+    {
+        saved.addressType = "Public";
+    }
+    else if (addressType == 1)
+    {
+        saved.addressType = "Random";
+    }
+    else
+    {
+        saved.addressType = "Unknown";
+    }
+
+    // ---------- TX POWER ----------
+
+    saved.hasTxPower =
+        device->haveTXPower();
+
+    if (saved.hasTxPower)
+    {
+        saved.txPower =
+            device->getTXPower();
+    }
+    else
+    {
+        saved.txPower = 0;
+    }
+
+    // ---------- MANUFACTURER ----------
+
+    saved.hasManufacturer =
+        device->haveManufacturerData();
+
+    saved.manufacturerId = 0;
+    saved.manufacturerName = "";
+    saved.manufacturerData = "";
+
+    if (saved.hasManufacturer)
+    {
+        std::string data =
+            device->getManufacturerData();
+
+        saved.manufacturerData =
+            bytesToHex(data);
+
+        if (data.length() >= 2)
+        {
+            saved.manufacturerId =
+                (uint8_t)data[0] |
+                ((uint16_t)(uint8_t)data[1] << 8);
+
+            saved.manufacturerName =
+                getManufacturerName(
+                    saved.manufacturerId
+                );
+        }
+    }
+
+    // ---------- SERVICE UUID ----------
+
+    saved.hasServiceUUID =
+        device->haveServiceUUID();
+
+    saved.serviceUUID = "";
+
+    if (saved.hasServiceUUID)
+    {
+        saved.serviceUUID =
+            device->getServiceUUID()
+                .toString()
+                .c_str();
+    }
+
+    Serial.println("--------------------------------");
+
+    Serial.printf(
+        "#%d\n",
+        bleDeviceCount
+    );
+
+    Serial.printf(
+        "Name: %s\n",
+        saved.name.length() > 0
+            ? saved.name.c_str()
+            : "[Unknown]"
+    );
+
+    Serial.printf(
+        "Address: %s\n",
+        saved.address.c_str()
+    );
+
+    Serial.printf(
+        "Address type: %s\n",
+        saved.addressType.c_str()
+    );
+
+    Serial.printf(
+        "RSSI: %d dBm\n",
+        saved.rssi
+    );
+
+    if (saved.hasTxPower)
+    {
+        Serial.printf(
+            "TX Power: %d dBm\n",
+            saved.txPower
+        );
+    }
+
+    if (saved.hasManufacturer)
+    {
+        Serial.printf(
+            "Vendor: %s (0x%04X)\n",
+            saved.manufacturerName.c_str(),
+            saved.manufacturerId
+        );
+
+        Serial.printf(
+            "Manufacturer Data: %s\n",
+            saved.manufacturerData.c_str()
+        );
+    }
+
+    if (saved.hasServiceUUID)
+    {
+        Serial.printf(
+            "Service UUID: %s\n",
+            saved.serviceUUID.c_str()
+        );
+    }
+
+        bleDeviceCount++;
+    }
+
+    scanner->clearResults();
+
+    sortBLEDevicesByRSSI();
+
+    bleSelected = 0;
+
+    Serial.println("BLE scan completed");
+    Serial.println("Sorted by RSSI");
+
+    drawBLEResults();
+}
+
+// ================= SETUP =================
+
+void setup()
+{
+    Serial.begin(115200);
+    delay(1000);
+    wifiProfileConsole.begin();
+
+    Serial.println();
+    Serial.println("SENTINEL START");
+
+    pinMode(
+        BTN_TOP,
+        INPUT_PULLUP
+    );
+
+    pinMode(
+        BTN_MIDDLE,
+        INPUT_PULLUP
+    );
+
+    pinMode(
+        BTN_BOTTOM,
+        INPUT_PULLUP
+    );
+
+    display.init(
+        240,
+        320
+    );
+
+    display.setRotation(1);
+
+    NimBLEDevice::init(
+        "Sentinel"
+    );
+
+    Serial.println("BLE initialized");
+    size_t savedProfileCount = wifiProfiles.count();
+
+    if (savedProfileCount == 0 && WIFI_SSID[0] == '\0')
+    {
+        Serial.println(
+            "WiFi profiles are not configured; use WIFI_PROFILE_HELP over USB"
+        );
+    }
+    else
+    {
+        Serial.printf("Saved WiFi profiles: %u\n", savedProfileCount);
+
+        if (WIFI_SSID[0] != '\0')
+            Serial.printf("Build-time WiFi SSID: %s\n", WIFI_SSID);
+    }
+
+    drawMenu();
+    Serial.println("READY");
+}
+
+// ================= MAIN MENU INPUT =================
+
+void handleMainMenu()
+{
+    if (pressed(
+        BTN_TOP,
+        lastTop
+    ))
+    {
+        selectedItem--;
+
+        if (selectedItem < 0)
+        {
+            selectedItem =
+                MENU_COUNT - 1;
+        }
+
+        drawMenu();
+    }
+
+    if (pressed(
+        BTN_BOTTOM,
+        lastBottom
+    ))
+    {
+        selectedItem++;
+
+        if (
+            selectedItem >=
+            MENU_COUNT
+        )
+        {
+            selectedItem = 0;
+        }
+
+        drawMenu();
+    }
+
+    if (pressed(
+        BTN_MIDDLE,
+        lastMiddle
+    ))
+    {
+        if (selectedItem == 0)
+        {
+            currentScreen =
+                Screen::Bluetooth;
+
+            scanBLE();
+        }
+        else if (selectedItem == 2)
+        {
+            currentScreen =
+                Screen::WiFi;
+
+            scanWiFi();
+        }
+        else if (selectedItem == 3)
+        {
+            currentScreen =
+                Screen::WiFiGuard;
+
+            stopWiFiCSI();
+            wifiGuardScreen.enter();
+        }
+        else if (selectedItem == 4)
+        {
+            currentScreen =
+                Screen::WiFiCSI;
+
+            startWiFiCSI();
+        }
+        else if (selectedItem == 6)
+        {
+            currentScreen =
+                Screen::SystemInfo;
+
+            systemInfoScreen.draw();
+        }
+        else
+        {
+            Serial.print(
+                "Not implemented: "
+            );
+
+            Serial.println(
+                menuItems[selectedItem]
+            );
+        }
+    }
+}
+
+// ================= BLE INPUT =================
+
+void handleBluetooth()
+{
+    if (pressed(
+        BTN_TOP,
+        lastTop
+    ))
+    {
+        if (bleDeviceCount > 0)
+        {
+            bleSelected--;
+
+            if (bleSelected < 0)
+            {
+                bleSelected =
+                    bleDeviceCount - 1;
+            }
+
+            drawBLEResults();
+        }
+    }
+
+    if (pressed(
+        BTN_BOTTOM,
+        lastBottom
+    ))
+    {
+        if (bleDeviceCount > 0)
+        {
+            bleSelected++;
+
+            if (
+                bleSelected >=
+                bleDeviceCount
+            )
+            {
+                bleSelected = 0;
+            }
+
+            drawBLEResults();
+        }
+    }
+
+    if (pressed( BTN_MIDDLE, lastMiddle))
+    {
+        if (bleDeviceCount > 0)
+        {
+            currentScreen =
+                Screen::BLEDetails;
+
+            drawBLEDetails();
+        }
+        else
+        {
+            currentScreen = Screen::MainMenu;
+            drawMenu();
+        }
+    }
+}
+void handleBLEDetails()
+{
+    // Верхняя кнопка = новое сканирование
+    if (pressed(
+        BTN_TOP,
+        lastTop
+    ))
+    {
+        currentScreen =
+            Screen::Bluetooth;
+
+        scanBLE();
+
+        return;
+    }
+
+    // Средняя = назад к списку
+    if (pressed(
+        BTN_MIDDLE,
+        lastMiddle
+    ))
+    {
+        currentScreen =
+            Screen::Bluetooth;
+
+        drawBLEResults();
+
+        return;
+    }
+
+    // Нижняя = сразу назад в главное меню
+    if (pressed(
+        BTN_BOTTOM,
+        lastBottom
+    ))
+    {
+        currentScreen =
+            Screen::MainMenu;
+
+        drawMenu();
+
+        return;
+    }
+}
+// ================= LOOP =================
+
+void loop()
+{
+    wifiProfileConsole.poll();
+
+    switch (currentScreen)
+    {
+        case Screen::MainMenu:
+            handleMainMenu();
+            break;
+
+        case Screen::Bluetooth:
+            handleBluetooth();
+            break;
+
+        case Screen::BLEDetails:
+            handleBLEDetails();
+            break;
+        case Screen::WiFi:
+            handleWiFi();
+            break;
+
+        case Screen::WiFiDetails:
+            handleWiFiDetails();
+            break;
+
+        case Screen::WiFiGuard:
+            if (wifiGuardScreen.update(
+                    pressed(BTN_TOP, lastTop),
+                    pressed(BTN_MIDDLE, lastMiddle),
+                    pressed(BTN_BOTTOM, lastBottom)
+                ))
+            {
+                currentScreen = Screen::MainMenu;
+                drawMenu();
+            }
+            break;
+
+        case Screen::SystemInfo:
+            if (pressed(BTN_TOP, lastTop))
+                systemInfoScreen.draw();
+
+            if (pressed(BTN_MIDDLE, lastMiddle) ||
+                pressed(BTN_BOTTOM, lastBottom))
+            {
+                currentScreen = Screen::MainMenu;
+                drawMenu();
+            }
+            break;
+
+        case Screen::WiFiCSI:
+            handleWiFiCSI();
+            break;
+    }
+
+    delay(20);
+}
