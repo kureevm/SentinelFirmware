@@ -2,28 +2,36 @@
 #include "StorageFeatures.h"
 
 #include <MFRC522.h>
+#include <Preferences.h>
 #include <SPI.h>
 #include <esp_system.h>
+#include <mbedtls/sha256.h>
 
 namespace
 {
 constexpr byte SENTINEL_TOKEN_BLOCK = 4;
 constexpr uint32_t WRITE_ARM_WINDOW_MS = 10000;
-constexpr uint8_t RFID_ACTION_COUNT = 5;
+constexpr uint32_t VERIFY_ARM_WINDOW_MS = 10000;
+constexpr uint8_t RFID_ACTION_COUNT = 7;
+constexpr char RFID_PREFERENCES_NAMESPACE[] = "sent-rfid";
 
 enum class RfidAction : uint8_t
 {
     ReadTag,
+    SaveIdentity,
+    VerifySaved,
     WriteToken,
-    Clear,
+    DeleteSaved,
     Reinitialize,
     Exit
 };
 
 const char* const RFID_ACTION_LABELS[RFID_ACTION_COUNT] = {
     "READ TAG",
+    "SAVE ID",
+    "VERIFY SAVED",
     "WRITE TOKEN",
-    "CLEAR",
+    "DELETE SAVED",
     "REINIT READER",
     "EXIT"
 };
@@ -34,12 +42,15 @@ uint8_t readerVersion = 0;
 String lastUid;
 String lastType;
 String lastToken = "none";
-String writeStatus = "safe read mode";
+String actionStatus = "safe read mode";
+String savedFingerprint;
 uint32_t lastReadMs = 0;
 uint32_t readCount = 0;
 String lastLogStatus = "SD unavailable";
 bool writeArmed = false;
 uint32_t writeArmExpiresAt = 0;
+bool verifyArmed = false;
+uint32_t verifyArmExpiresAt = 0;
 uint8_t selectedAction = 0;
 
 String uidToString(const MFRC522::Uid& uid)
@@ -60,6 +71,100 @@ String uidToString(const MFRC522::Uid& uid)
 
     value.toUpperCase();
     return value;
+}
+
+String fingerprintUid(const String& uid)
+{
+    unsigned char digest[32];
+    const int result = mbedtls_sha256_ret(
+        reinterpret_cast<const unsigned char*>(uid.c_str()),
+        uid.length(),
+        digest,
+        0
+    );
+
+    if (result != 0)
+        return "";
+
+    static const char HEX_DIGITS[] = "0123456789ABCDEF";
+    char encoded[65];
+
+    for (size_t index = 0; index < sizeof(digest); index++)
+    {
+        encoded[index * 2] = HEX_DIGITS[digest[index] >> 4];
+        encoded[index * 2 + 1] = HEX_DIGITS[digest[index] & 0x0F];
+    }
+
+    encoded[64] = '\0';
+    return String(encoded);
+}
+
+void loadSavedIdentity()
+{
+    Preferences preferences;
+
+    if (!preferences.begin(RFID_PREFERENCES_NAMESPACE, true))
+    {
+        savedFingerprint = "";
+        return;
+    }
+
+    savedFingerprint = preferences.getString("fp", "");
+    preferences.end();
+}
+
+bool saveCurrentIdentity()
+{
+    if (lastUid.length() == 0)
+    {
+        actionStatus = "read a tag first";
+        return false;
+    }
+
+    const String fingerprint = fingerprintUid(lastUid);
+    if (fingerprint.length() == 0)
+    {
+        actionStatus = "fingerprint failed";
+        return false;
+    }
+
+    Preferences preferences;
+    if (!preferences.begin(RFID_PREFERENCES_NAMESPACE, false))
+    {
+        actionStatus = "NVS unavailable";
+        return false;
+    }
+
+    const bool saved = preferences.putString("fp", fingerprint) > 0;
+    preferences.end();
+
+    if (!saved)
+    {
+        actionStatus = "save failed";
+        return false;
+    }
+
+    savedFingerprint = fingerprint;
+    actionStatus = "ID fingerprint saved";
+    Serial.println("RFID identity fingerprint saved to NVS");
+    return true;
+}
+
+void deleteSavedIdentity()
+{
+    Preferences preferences;
+
+    if (!preferences.begin(RFID_PREFERENCES_NAMESPACE, false))
+    {
+        actionStatus = "NVS unavailable";
+        return;
+    }
+
+    preferences.remove("fp");
+    preferences.end();
+    savedFingerprint = "";
+    actionStatus = "saved ID deleted";
+    Serial.println("RFID identity fingerprint deleted from NVS");
 }
 
 bool isClassicType(MFRC522::PICC_Type type)
@@ -156,7 +261,7 @@ bool writeSentinelToken(MFRC522::PICC_Type type)
 
     if (!isClassicType(type))
     {
-        writeStatus = "blocked: Classic only";
+        actionStatus = "blocked: Classic only";
         lastToken = "unsupported type";
         return false;
     }
@@ -164,7 +269,7 @@ bool writeSentinelToken(MFRC522::PICC_Type type)
     MFRC522::StatusCode status = authenticateTokenBlock();
     if (status != MFRC522::STATUS_OK)
     {
-        writeStatus = "blocked: default key failed";
+        actionStatus = "blocked: default key failed";
         lastToken = "locked/non-Sentinel";
         reader.PCD_StopCrypto1();
         return false;
@@ -176,14 +281,14 @@ bool writeSentinelToken(MFRC522::PICC_Type type)
 
     if (status != MFRC522::STATUS_OK)
     {
-        writeStatus = "blocked: cannot read block 4";
+        actionStatus = "blocked: cannot read block 4";
         reader.PCD_StopCrypto1();
         return false;
     }
 
     if (!isEmptyTokenBlock(current) && !hasSentinelPrefix(current))
     {
-        writeStatus = "blocked: block 4 contains data";
+        actionStatus = "blocked: block 4 contains data";
         lastToken = "foreign data preserved";
         reader.PCD_StopCrypto1();
         Serial.println("RFID write blocked: block 4 is not empty Sentinel data");
@@ -200,7 +305,7 @@ bool writeSentinelToken(MFRC522::PICC_Type type)
 
     if (status != MFRC522::STATUS_OK)
     {
-        writeStatus = "write failed";
+        actionStatus = "write failed";
         reader.PCD_StopCrypto1();
         return false;
     }
@@ -212,12 +317,12 @@ bool writeSentinelToken(MFRC522::PICC_Type type)
 
     if (status != MFRC522::STATUS_OK || memcmp(tokenData, verify, 16) != 0)
     {
-        writeStatus = "verify failed";
+        actionStatus = "verify failed";
         return false;
     }
 
     lastToken = generatedToken;
-    writeStatus = "written + verified";
+    actionStatus = "written + verified";
     Serial.println("Sentinel token written and verified in MIFARE block 4");
     return true;
 }
@@ -283,13 +388,19 @@ void drawReaderScreen()
     display.setTextColor(ST77XX_GREEN);
     display.setCursor(10, 117);
     display.print("State:");
-    display.setTextColor(writeArmed ? ST77XX_YELLOW : ST77XX_WHITE);
+    display.setTextColor(
+        (writeArmed || verifyArmed) ? ST77XX_YELLOW : ST77XX_WHITE
+    );
     display.setCursor(60, 117);
 
     if (!readerDetected)
         display.print("Check 3.3V, SPI, SS=7, RST=14");
+    else if (writeArmed)
+        display.print("WRITE ARMED - present OWN tag");
+    else if (verifyArmed)
+        display.print("VERIFY ARMED - present tag");
     else
-        display.print(writeArmed ? "ARMED - present OWN tag" : writeStatus);
+        display.print(actionStatus);
 
     display.setTextColor(ST77XX_GREEN);
     display.setCursor(10, 135);
@@ -299,19 +410,26 @@ void drawReaderScreen()
     display.print(readCount);
 
     display.setTextColor(ST77XX_GREEN);
-    display.setCursor(120, 135);
+    display.setCursor(90, 135);
+    display.print("Saved:");
+    display.setTextColor(ST77XX_WHITE);
+    display.setCursor(135, 135);
+    display.print(savedFingerprint.length() > 0 ? "YES" : "NO");
+
+    display.setTextColor(ST77XX_GREEN);
+    display.setCursor(190, 135);
     display.print("SD:");
     display.setTextColor(ST77XX_WHITE);
-    display.setCursor(145, 135);
-    display.print(lastLogStatus);
+    display.setCursor(215, 135);
+    display.print(isSDCardMounted() ? "OK" : "NO");
 
     for (uint8_t index = 0; index < RFID_ACTION_COUNT; index++)
     {
-        const int16_t y = 149 + index * 13;
+        const int16_t y = 145 + index * 10;
 
         if (index == selectedAction)
         {
-            display.fillRoundRect(8, y - 2, 304, 12, 3, ST77XX_WHITE);
+            display.fillRoundRect(8, y - 1, 304, 10, 2, ST77XX_WHITE);
             display.setTextColor(ST77XX_BLACK);
         }
         else
@@ -374,7 +492,22 @@ void pollReader()
     if (writeArmed)
         writeSentinelToken(type);
     else
+    {
         readSentinelToken(type);
+
+        if (verifyArmed)
+        {
+            verifyArmed = false;
+            const String fingerprint = fingerprintUid(lastUid);
+            const bool matches = fingerprint.length() > 0 &&
+                                 fingerprint == savedFingerprint;
+            actionStatus = matches ? "MATCH: saved identity" : "NO MATCH";
+            Serial.println(
+                matches ? "RFID identity matches saved fingerprint"
+                        : "RFID identity does not match saved fingerprint"
+            );
+        }
+    }
 
     reader.PICC_HaltA();
     reader.PCD_StopCrypto1();
@@ -393,8 +526,14 @@ void pollReader()
 void enterRFID()
 {
     writeArmed = false;
-    writeStatus = "safe read mode";
+    verifyArmed = false;
+    actionStatus = "safe read mode";
     selectedAction = 0;
+    lastUid = "";
+    lastType = "";
+    lastToken = "none";
+    lastReadMs = 0;
+    loadSavedIdentity();
     initializeReader();
     drawReaderScreen();
 }
@@ -407,44 +546,79 @@ void executeSelectedAction()
     {
         case RfidAction::ReadTag:
             writeArmed = false;
-            writeStatus = "read mode: present a tag";
+            verifyArmed = false;
+            actionStatus = "read mode: present a tag";
+            lastReadMs = 0;
+            drawReaderScreen();
+            break;
+
+        case RfidAction::SaveIdentity:
+            writeArmed = false;
+            verifyArmed = false;
+            saveCurrentIdentity();
+            drawReaderScreen();
+            break;
+
+        case RfidAction::VerifySaved:
+            writeArmed = false;
+
+            if (!readerDetected)
+            {
+                verifyArmed = false;
+                actionStatus = "reader unavailable";
+                drawReaderScreen();
+                break;
+            }
+
+            if (savedFingerprint.length() == 0)
+            {
+                verifyArmed = false;
+                actionStatus = "no saved ID";
+                drawReaderScreen();
+                break;
+            }
+
+            verifyArmed = true;
+            verifyArmExpiresAt = millis() + VERIFY_ARM_WINDOW_MS;
+            actionStatus = "verify armed for 10 seconds";
             lastReadMs = 0;
             drawReaderScreen();
             break;
 
         case RfidAction::WriteToken:
+            verifyArmed = false;
+
             if (!readerDetected)
             {
-                writeStatus = "reader unavailable";
+                actionStatus = "reader unavailable";
                 drawReaderScreen();
                 break;
             }
 
             writeArmed = true;
             writeArmExpiresAt = millis() + WRITE_ARM_WINDOW_MS;
-            writeStatus = "armed for 10 seconds";
+            actionStatus = "armed for 10 seconds";
             drawReaderScreen();
             break;
 
-        case RfidAction::Clear:
+        case RfidAction::DeleteSaved:
             writeArmed = false;
-            lastUid = "";
-            lastType = "";
-            lastToken = "none";
-            readCount = 0;
-            writeStatus = "screen cleared";
+            verifyArmed = false;
+            deleteSavedIdentity();
             drawReaderScreen();
             break;
 
         case RfidAction::Reinitialize:
             writeArmed = false;
-            writeStatus = "reader reinitialized";
+            verifyArmed = false;
+            actionStatus = "reader reinitialized";
             initializeReader();
             drawReaderScreen();
             break;
 
         case RfidAction::Exit:
             writeArmed = false;
+            verifyArmed = false;
             currentScreen = Screen::MainMenu;
             drawMenu();
             break;
@@ -457,7 +631,15 @@ void handleRFID()
         static_cast<int32_t>(millis() - writeArmExpiresAt) >= 0)
     {
         writeArmed = false;
-        writeStatus = "arm expired; no write";
+        actionStatus = "arm expired; no write";
+        drawReaderScreen();
+    }
+
+    if (verifyArmed &&
+        static_cast<int32_t>(millis() - verifyArmExpiresAt) >= 0)
+    {
+        verifyArmed = false;
+        actionStatus = "verify expired";
         drawReaderScreen();
     }
 
