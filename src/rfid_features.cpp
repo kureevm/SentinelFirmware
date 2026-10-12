@@ -11,7 +11,9 @@ namespace
 {
 constexpr byte SENTINEL_TOKEN_BLOCK = 4;
 constexpr uint32_t WRITE_ARM_WINDOW_MS = 10000;
+constexpr uint32_t WRITE_CONFIRM_WINDOW_MS = 5000;
 constexpr uint32_t VERIFY_ARM_WINDOW_MS = 10000;
+constexpr uint32_t TAG_REPEAT_SUPPRESS_MS = 3000;
 constexpr uint8_t RFID_ACTION_COUNT = 7;
 constexpr char RFID_PREFERENCES_NAMESPACE[] = "sent-rfid";
 
@@ -28,9 +30,9 @@ enum class RfidAction : uint8_t
 
 const char* const RFID_ACTION_LABELS[RFID_ACTION_COUNT] = {
     "READ TAG",
-    "SAVE ID",
-    "VERIFY SAVED",
-    "WRITE TOKEN",
+    "SAVE SCANNED ID",
+    "CHECK SAVED ID",
+    "WRITE LAB TOKEN",
     "DELETE SAVED",
     "REINIT READER",
     "EXIT"
@@ -49,6 +51,8 @@ uint32_t readCount = 0;
 String lastLogStatus = "SD unavailable";
 bool writeArmed = false;
 uint32_t writeArmExpiresAt = 0;
+bool writeConfirmPending = false;
+uint32_t writeConfirmExpiresAt = 0;
 bool verifyArmed = false;
 uint32_t verifyArmExpiresAt = 0;
 uint8_t selectedAction = 0;
@@ -165,6 +169,30 @@ void deleteSavedIdentity()
     savedFingerprint = "";
     actionStatus = "saved ID deleted";
     Serial.println("RFID identity fingerprint deleted from NVS");
+}
+
+uint16_t statusPanelColor()
+{
+    if (writeArmed || writeConfirmPending || verifyArmed)
+        return ST77XX_YELLOW;
+
+    if (actionStatus.startsWith("TAG READ") ||
+        actionStatus.startsWith("MATCH") ||
+        actionStatus.startsWith("ID fingerprint saved") ||
+        actionStatus.startsWith("written + verified"))
+    {
+        return ST77XX_GREEN;
+    }
+
+    if (actionStatus.startsWith("NO MATCH") ||
+        actionStatus.startsWith("blocked") ||
+        actionStatus.endsWith("failed") ||
+        actionStatus.endsWith("unavailable"))
+    {
+        return ST77XX_RED;
+    }
+
+    return ST77XX_BLUE;
 }
 
 bool isClassicType(MFRC522::PICC_Type type)
@@ -385,18 +413,23 @@ void drawReaderScreen()
     display.setCursor(60, 99);
     display.print(lastToken);
 
-    display.setTextColor(ST77XX_GREEN);
-    display.setCursor(10, 117);
-    display.print("State:");
+    const uint16_t panelColor = statusPanelColor();
+    display.fillRoundRect(8, 109, 304, 22, 3, panelColor);
     display.setTextColor(
-        (writeArmed || verifyArmed) ? ST77XX_YELLOW : ST77XX_WHITE
+        panelColor == ST77XX_BLUE || panelColor == ST77XX_RED
+            ? ST77XX_WHITE
+            : ST77XX_BLACK
     );
-    display.setCursor(60, 117);
+    display.setCursor(14, 112);
+    display.print("STATE");
+    display.setCursor(14, 122);
 
     if (!readerDetected)
         display.print("Check 3.3V, SPI, SS=7, RST=14");
     else if (writeArmed)
         display.print("WRITE ARMED - present OWN tag");
+    else if (writeConfirmPending)
+        display.print("PRESS EXECUTE AGAIN: LAB WRITE");
     else if (verifyArmed)
         display.print("VERIFY ARMED - present tag");
     else
@@ -456,6 +489,8 @@ void initializeReader()
     digitalWrite(TFT_CS, HIGH);
     pinMode(RFID_SS, OUTPUT);
     digitalWrite(RFID_SS, HIGH);
+    pinMode(SD_CS, OUTPUT);
+    digitalWrite(SD_CS, HIGH);
 
     SPI.begin(SCK, MISO, MOSI);
     reader.PCD_Init();
@@ -479,7 +514,19 @@ void pollReader()
     if (!reader.PICC_IsNewCardPresent() || !reader.PICC_ReadCardSerial())
         return;
 
-    lastUid = uidToString(reader.uid);
+    const String scannedUid = uidToString(reader.uid);
+
+    if (!writeArmed && !verifyArmed &&
+        scannedUid == lastUid &&
+        millis() - lastReadMs < TAG_REPEAT_SUPPRESS_MS)
+    {
+        reader.PICC_HaltA();
+        reader.PCD_StopCrypto1();
+        digitalWrite(RFID_SS, HIGH);
+        return;
+    }
+
+    lastUid = scannedUid;
     const MFRC522::PICC_Type type = reader.PICC_GetType(reader.uid.sak);
     lastType = reader.PICC_GetTypeName(type);
     lastReadMs = millis();
@@ -507,6 +554,10 @@ void pollReader()
                         : "RFID identity does not match saved fingerprint"
             );
         }
+        else
+        {
+            actionStatus = "TAG READ - choose SAVE SCANNED ID";
+        }
     }
 
     reader.PICC_HaltA();
@@ -526,6 +577,7 @@ void pollReader()
 void enterRFID()
 {
     writeArmed = false;
+    writeConfirmPending = false;
     verifyArmed = false;
     actionStatus = "safe read mode";
     selectedAction = 0;
@@ -546,6 +598,7 @@ void executeSelectedAction()
     {
         case RfidAction::ReadTag:
             writeArmed = false;
+            writeConfirmPending = false;
             verifyArmed = false;
             actionStatus = "read mode: present a tag";
             lastReadMs = 0;
@@ -554,6 +607,7 @@ void executeSelectedAction()
 
         case RfidAction::SaveIdentity:
             writeArmed = false;
+            writeConfirmPending = false;
             verifyArmed = false;
             saveCurrentIdentity();
             drawReaderScreen();
@@ -561,6 +615,7 @@ void executeSelectedAction()
 
         case RfidAction::VerifySaved:
             writeArmed = false;
+            writeConfirmPending = false;
 
             if (!readerDetected)
             {
@@ -588,6 +643,15 @@ void executeSelectedAction()
         case RfidAction::WriteToken:
             verifyArmed = false;
 
+            if (writeArmed)
+            {
+                writeArmed = false;
+                writeConfirmPending = false;
+                actionStatus = "lab write cancelled";
+                drawReaderScreen();
+                break;
+            }
+
             if (!readerDetected)
             {
                 actionStatus = "reader unavailable";
@@ -595,14 +659,25 @@ void executeSelectedAction()
                 break;
             }
 
+            if (!writeConfirmPending)
+            {
+                writeConfirmPending = true;
+                writeConfirmExpiresAt = millis() + WRITE_CONFIRM_WINDOW_MS;
+                actionStatus = "confirm lab write";
+                drawReaderScreen();
+                break;
+            }
+
+            writeConfirmPending = false;
             writeArmed = true;
             writeArmExpiresAt = millis() + WRITE_ARM_WINDOW_MS;
-            actionStatus = "armed for 10 seconds";
+            actionStatus = "lab write armed for 10 seconds";
             drawReaderScreen();
             break;
 
         case RfidAction::DeleteSaved:
             writeArmed = false;
+            writeConfirmPending = false;
             verifyArmed = false;
             deleteSavedIdentity();
             drawReaderScreen();
@@ -610,6 +685,7 @@ void executeSelectedAction()
 
         case RfidAction::Reinitialize:
             writeArmed = false;
+            writeConfirmPending = false;
             verifyArmed = false;
             actionStatus = "reader reinitialized";
             initializeReader();
@@ -618,6 +694,7 @@ void executeSelectedAction()
 
         case RfidAction::Exit:
             writeArmed = false;
+            writeConfirmPending = false;
             verifyArmed = false;
             currentScreen = Screen::MainMenu;
             drawMenu();
@@ -635,6 +712,14 @@ void handleRFID()
         drawReaderScreen();
     }
 
+    if (writeConfirmPending &&
+        static_cast<int32_t>(millis() - writeConfirmExpiresAt) >= 0)
+    {
+        writeConfirmPending = false;
+        actionStatus = "lab write confirmation expired";
+        drawReaderScreen();
+    }
+
     if (verifyArmed &&
         static_cast<int32_t>(millis() - verifyArmExpiresAt) >= 0)
     {
@@ -645,6 +730,14 @@ void handleRFID()
 
     if (pressed(BTN_TOP, lastTop))
     {
+        if (writeArmed || writeConfirmPending || verifyArmed)
+        {
+            writeArmed = false;
+            writeConfirmPending = false;
+            verifyArmed = false;
+            actionStatus = "pending action cancelled";
+        }
+
         if (selectedAction == 0)
             selectedAction = RFID_ACTION_COUNT - 1;
         else
@@ -662,6 +755,14 @@ void handleRFID()
 
     if (pressed(BTN_BOTTOM, lastBottom))
     {
+        if (writeArmed || writeConfirmPending || verifyArmed)
+        {
+            writeArmed = false;
+            writeConfirmPending = false;
+            verifyArmed = false;
+            actionStatus = "pending action cancelled";
+        }
+
         selectedAction = (selectedAction + 1) % RFID_ACTION_COUNT;
         drawReaderScreen();
         return;
